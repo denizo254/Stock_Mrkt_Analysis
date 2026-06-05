@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# Stock Market Analysis & Investment Optimization — Python dependencies
+# Tested against Python 3.11+
+# ---------------------------------------------------------------------------
+
+# Data ingestion
+yfinance>=0.2.40
+
+# Core scientific stack
+pandas>=2.1
+numpy>=1.26
+scipy>=1.11
+
+# Statistics / time-series diagnostics (ADF test, OLS)
+statsmodels>=0.14
+
+# Machine learning
+scikit-learn>=1.4
+xgboost>=2.0
+
+# Visualization
+matplotlib>=3.8
+seaborn>=0.13
+plotly>=5.20
+
+# Nice-to-have: progress + tabular reports
+tqdm>=4.66
+tabulate>=0.9
