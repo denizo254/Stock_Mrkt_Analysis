@@ -65,9 +65,57 @@ def annualised_mean(returns: pd.DataFrame) -> pd.Series:
     return returns.mean() * TRADING_DAYS
 
 
-def annualised_cov(returns: pd.DataFrame) -> pd.DataFrame:
-    """Annualised covariance matrix:  Σ = cov_daily × 252."""
-    return returns.cov() * TRADING_DAYS
+def annualised_cov(
+    returns: pd.DataFrame, method: str = config.PORTFOLIO.cov_method
+) -> pd.DataFrame:
+    """
+    Annualised covariance matrix:  Σ = cov_daily × 252.
+
+    method
+    ------
+    'sample'      : the empirical covariance (unbiased estimator).
+    'ledoit_wolf' : Ledoit-Wolf shrinkage — pulls the sample covariance toward
+                    a scaled-identity target by an analytically-optimal amount,
+                    trading a little bias for a large variance reduction. The
+                    result is better-conditioned and gives stabler, less
+                    extreme optimiser weights out-of-sample.
+    """
+    if method == "ledoit_wolf":
+        from sklearn.covariance import LedoitWolf
+
+        lw = LedoitWolf().fit(returns.to_numpy())
+        daily = pd.DataFrame(lw.covariance_, index=returns.columns, columns=returns.columns)
+    elif method == "sample":
+        daily = returns.cov()
+    else:
+        raise ValueError(f"Unknown cov_method '{method}'. Use 'sample' or 'ledoit_wolf'.")
+    return daily * TRADING_DAYS
+
+
+def apply_position_cap(weights: pd.Series, cap: float) -> pd.Series:
+    """
+    Enforce a per-name weight cap while keeping the portfolio fully invested
+    (∑w = 1) and long-only, via iterative water-filling: clip the over-cap
+    names, then redistribute the freed weight pro-rata to names with headroom,
+    repeating until convergence.
+    """
+    if cap is None or cap >= 1.0:
+        return weights
+    w = weights.clip(lower=0.0)
+    if w.sum() <= 0:
+        return weights
+    w = w / w.sum()
+    for _ in range(100):
+        over = w > cap + 1e-12
+        if not over.any():
+            break
+        w = w.clip(upper=cap)
+        deficit = 1.0 - w.sum()
+        room = (cap - w).clip(lower=0.0)
+        if room.sum() <= 1e-12:
+            break  # cap × n_assets < 1: infeasible, return best effort
+        w = w + deficit * room / room.sum()
+    return w
 
 
 # ===========================================================================
@@ -382,6 +430,8 @@ class RollingBacktestResult:
     total_cost: float                # cumulative cost as a return-fraction sum
     rebalance_dates: pd.DatetimeIndex
     n_rebalances: int
+    exposure: pd.Series | None = None   # daily risky-asset exposure (vol target / DD stop)
+    n_stops: int = 0                    # number of drawdown-stop de-risk events
 
 
 def _rebalance_dates(index: pd.DatetimeIndex, frequency: str) -> pd.DatetimeIndex:
@@ -427,6 +477,12 @@ def rolling_rebalance_backtest(
     mu_override: pd.Series | None = None,
     mu_provider=None,
     weight_transform=None,
+    cov_method: str = config.PORTFOLIO.cov_method,
+    max_weight: float | None = config.RISK.max_weight,
+    target_vol: float | None = config.RISK.target_vol,
+    max_leverage: float = config.RISK.max_leverage,
+    drawdown_stop: float | None = config.RISK.drawdown_stop,
+    drawdown_reenter: float = config.RISK.drawdown_reenter,
 ) -> RollingBacktestResult:
     """
     Walk-forward portfolio backtest with periodic rebalancing + trading costs.
@@ -473,6 +529,7 @@ def rolling_rebalance_backtest(
     # ---- 1. Pre-compute target weights at each valid rebalance date --------
     targets: dict[pd.Timestamp, pd.Series] = {}
     turnover_records: dict[pd.Timestamp, float] = {}
+    exposures: dict[pd.Timestamp, float] = {}
     for d in rebal_dates:
         window = log_ret.loc[:d]
         if rolling_lookback:
@@ -491,11 +548,21 @@ def rolling_rebalance_backtest(
         else:
             mu = pd.Series(mu).reindex(tickers)
 
-        cov = annualised_cov(window)
+        cov = annualised_cov(window, method=cov_method)
         w = _optimise_weights(strategy, mu, cov).reindex(tickers).fillna(0.0)
         if weight_transform is not None:
             w = pd.Series(weight_transform(d, w, window)).reindex(tickers).fillna(0.0)
+        if max_weight is not None:
+            w = apply_position_cap(w, max_weight)        # risk overlay: position cap
         targets[d] = w
+
+        # Volatility-targeting exposure (risk overlay): scale so ex-ante vol ≈
+        # target, capped at max_leverage. The uninvested fraction earns cash.
+        if target_vol is not None:
+            port_vol = float(np.sqrt(max(w.to_numpy() @ cov.to_numpy() @ w.to_numpy(), 1e-18)))
+            exposures[d] = float(np.clip(target_vol / port_vol, 0.0, max_leverage))
+        else:
+            exposures[d] = 1.0
 
     if not targets:
         raise RuntimeError(
@@ -503,48 +570,89 @@ def rolling_rebalance_backtest(
             "widen the date range."
         )
 
-    # Map each target to the first trading day it becomes active.
+    # Map each target (weights + exposure) to the day it becomes active.
     eff_target: dict[pd.Timestamp, pd.Series] = {}
+    eff_exposure: dict[pd.Timestamp, float] = {}
     pos_of = {dt: i for i, dt in enumerate(all_dates)}
     for d, w in targets.items():
         nxt = pos_of[d] + 1
         if nxt < len(all_dates):
             eff_target[all_dates[nxt]] = w
+            eff_exposure[all_dates[nxt]] = exposures[d]
 
     # ---- 2. Simulate forward day-by-day ------------------------------------
+    # State:
+    #   drift_w   risky weights drifted INTO the current day (always sums to 1)
+    #   h_pre     risky holdings (fractions of equity) carried into today, i.e.
+    #             prev_eff_exposure × drift_w; the cash leg is (1 − Σ h_pre)
+    # Trading cost is charged on Σ|h_post − h_pre| whenever we actually trade
+    # (a rebalance, or an exposure change from vol-targeting / drawdown stop).
+    rf_daily = config.RISK_FREE_RATE / TRADING_DAYS
     sim_dates = all_dates[all_dates >= min(eff_target)]
-    equity, gross_equity = 1.0, 1.0
-    drift_w: pd.Series | None = None
+    equity, gross_equity, peak = 1.0, 1.0, 1.0
+    drift_w: pd.Series | None = None        # risky weights drifted into today
+    active_exposure = 1.0                   # overlay exposure for the holding period
+    prev_eff_exposure = 0.0                 # exposure actually held yesterday
+    stopped = False
     rows = []
     total_cost = 0.0
+    n_stops = 0
 
     for date in sim_dates:
+        rebalanced = date in eff_target
+
+        # Risky holdings carried into today (before any trade).
+        h_pre = (
+            np.zeros(len(tickers))
+            if drift_w is None
+            else prev_eff_exposure * drift_w.to_numpy()
+        )
+
+        if rebalanced:
+            active_exposure = eff_exposure[date]
+            stopped = False                 # a fresh rebalance re-risks the book
+
+        # Drawdown-stop state machine (driven only by realised equity to date).
+        if drawdown_stop is not None and not rebalanced:
+            dd = equity / peak - 1.0
+            if stopped and dd >= -drawdown_reenter:
+                stopped = False             # recovered enough -> re-risk
+            elif not stopped and dd <= -drawdown_stop:
+                stopped = True
+                n_stops += 1
+        eff_exp = 0.0 if stopped else active_exposure
+
+        # Risky weights held through today: reset to target on a rebalance,
+        # else the drifted weights.
+        risky_w = eff_target[date] if rebalanced else drift_w
+
+        # Post-trade holdings and the cost of getting there.
+        h_post = eff_exp * risky_w.to_numpy()
         cost = 0.0
-        if date in eff_target:
-            new_w = eff_target[date]
-            if drift_w is None:
-                turnover = float(new_w.abs().sum())            # initial buy from cash
-            else:
-                turnover = float((new_w - drift_w.reindex(new_w.index).fillna(0.0)).abs().sum())
+        if rebalanced or abs(eff_exp - prev_eff_exposure) > 1e-12:
+            turnover = float(np.abs(h_post - h_pre).sum())
             cost = turnover * cost_rate
             total_cost += cost
             turnover_records[date] = turnover
-            drift_w = new_w.copy()
 
-        r = simple.loc[date, drift_w.index]
-        gross_ret = float((drift_w * r).sum())
+        # Today's return: risky leg + cash leg, less cost.
+        r = simple.loc[date, risky_w.index]
+        risky_ret = float((risky_w * r).sum())
+        gross_ret = eff_exp * risky_ret + (1.0 - eff_exp) * rf_daily
         net_ret = gross_ret - cost
 
         gross_equity *= 1.0 + gross_ret
         equity *= 1.0 + net_ret
+        peak = max(peak, equity)
         rows.append(
             {"date": date, "net_ret": net_ret, "gross_ret": gross_ret,
-             "equity": equity, "gross_equity": gross_equity}
+             "equity": equity, "gross_equity": gross_equity, "exposure": eff_exp}
         )
 
-        # Drift the weights with the day's price moves for tomorrow.
-        drifted = drift_w * (1.0 + r)
+        # Drift risky weights with today's moves for tomorrow.
+        drifted = risky_w * (1.0 + r)
         drift_w = drifted / drifted.sum()
+        prev_eff_exposure = eff_exp
 
     sim = pd.DataFrame(rows).set_index("date")
     weights_history = pd.DataFrame(targets).T
@@ -560,10 +668,21 @@ def rolling_rebalance_backtest(
         total_cost=total_cost,
         rebalance_dates=pd.DatetimeIndex(list(targets.keys())),
         n_rebalances=len(targets),
+        exposure=sim["exposure"],
+        n_stops=n_stops,
     )
+    overlays = []
+    if cov_method != "sample":
+        overlays.append(cov_method)
+    if max_weight is not None:
+        overlays.append(f"cap={max_weight:.0%}")
+    if target_vol is not None:
+        overlays.append(f"voltgt={target_vol:.0%}")
+    if drawdown_stop is not None:
+        overlays.append(f"ddstop={drawdown_stop:.0%}({n_stops} hits)")
     logger.info(
-        "[%s] rolling backtest: %d rebalances, %s→%s, total cost drag=%.2f%%, "
-        "final equity=%.3fx (gross %.3fx)",
+        "[%s] rolling backtest: %d rebalances, %s→%s, cost drag=%.2f%%, "
+        "final equity=%.3fx (gross %.3fx)%s",
         strategy,
         result.n_rebalances,
         sim.index.min().date(),
@@ -571,5 +690,6 @@ def rolling_rebalance_backtest(
         total_cost * 100,
         equity,
         gross_equity,
+        f" | overlays: {', '.join(overlays)}" if overlays else "",
     )
     return result

@@ -187,9 +187,42 @@ class PortfolioConfig:
     max_weight: float = 1.0
     # Number of points used to trace the efficient frontier.
     frontier_points: int = 60
+    # Covariance estimator: 'sample' (empirical) or 'ledoit_wolf' (shrinkage).
+    # Ledoit-Wolf shrinks the noisy sample covariance toward a structured
+    # target, which materially stabilises out-of-sample portfolio weights.
+    cov_method: str = "sample"
 
 
 PORTFOLIO = PortfolioConfig()
+
+
+# ---------------------------------------------------------------------------
+# Risk overlays (robustness layer over the rolling backtest)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class RiskOverlayConfig:
+    """
+    Optional risk controls applied on top of the optimiser's raw weights.
+    Every field defaults to "off" so the overlays are strictly opt-in and the
+    baseline behaviour is unchanged.
+    """
+
+    # Per-name position cap (e.g. 0.35 => no asset above 35%). None = no cap
+    # beyond the optimiser's own [min_weight, max_weight] bounds.
+    max_weight: float | None = None
+    # Annualised volatility target. When set, exposure is scaled so the
+    # portfolio's ex-ante vol ≈ target; the remainder sits in cash at the
+    # risk-free rate. None = fully invested (exposure 1.0).
+    target_vol: float | None = None
+    max_leverage: float = 1.0          # cap on exposure when vol-targeting
+    # Drawdown stop: de-risk to cash once the equity curve falls this far below
+    # its peak (e.g. 0.25 => -25%); re-risk once recovered to within
+    # ``drawdown_reenter`` of the peak. None = no stop.
+    drawdown_stop: float | None = None
+    drawdown_reenter: float = 0.10
+
+
+RISK = RiskOverlayConfig()
 
 
 # ---------------------------------------------------------------------------

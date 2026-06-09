@@ -414,3 +414,99 @@ def explain_model(
         figure_path=fig_path,
         csv_path=str(csv_path),
     )
+
+
+# ===========================================================================
+# ROBUSTNESS — honest walk-forward (rolling-retrain) model evaluation
+# ===========================================================================
+# The single train/test split above reports metrics on ONE hold-out period and
+# from ONE fit. A more honest read re-trains the model as it walks forward and
+# scores every prediction out-of-sample. We reuse the walk-forward generator
+# from ``signals`` (each prediction trained only on prior data) and score the
+# concatenated OOS predictions against the realised targets across the WHOLE
+# timeline — a far less luck-dependent estimate of live performance.
+
+
+@dataclass
+class WalkForwardEval:
+    ticker: str
+    engine: str
+    n_oos: int                 # number of out-of-sample predictions scored
+    # regression (OOS)
+    mae: float
+    rmse: float
+    directional_accuracy: float
+    # classification (OOS), NaN if the classifier could not be scored
+    accuracy: float
+    roc_auc: float
+
+
+def walk_forward_evaluation(
+    long: "pd.DataFrame",
+    ticker: str,
+    engine: str = "linear",
+    refit_freq: int = 21,
+    lookback: int = 252,
+) -> WalkForwardEval:
+    """
+    Honest, rolling-retrain out-of-sample evaluation for one ticker.
+
+    Returns regression metrics (MAE / RMSE / directional accuracy) on the
+    concatenated walk-forward predictions, plus classification metrics
+    (accuracy / ROC-AUC) when the direction signal is available.
+    """
+    from src.feature_engineering import build_features_for_ticker
+    from src.signals import walk_forward_predictions
+
+    wf = walk_forward_predictions(
+        long, ticker, engine=engine, refit_freq=refit_freq, lookback=lookback
+    )
+    feats = build_features_for_ticker(long, ticker)
+    y_ret = feats["target_logret"].reindex(wf.index)
+    y_dir = feats["target_dir"].reindex(wf.index)
+
+    pred = wf["pred_logret"]
+    rmse = float(np.sqrt(mean_squared_error(y_ret, pred)))
+    diracc = directional_accuracy(y_ret.to_numpy(), pred.to_numpy())
+
+    accuracy = roc_auc = float("nan")
+    if "prob_up" in wf:
+        proba = wf["prob_up"].dropna()
+        common = proba.index.intersection(y_dir.index)
+        if len(common) > 0 and y_dir.loc[common].nunique() == 2:
+            yhat = (proba.loc[common] >= 0.5).astype(int)
+            accuracy = float(accuracy_score(y_dir.loc[common], yhat))
+            roc_auc = float(roc_auc_score(y_dir.loc[common], proba.loc[common]))
+
+    result = WalkForwardEval(
+        ticker=ticker,
+        engine=engine,
+        n_oos=len(wf),
+        mae=float(mean_absolute_error(y_ret, pred)),
+        rmse=rmse,
+        directional_accuracy=diracc,
+        accuracy=accuracy,
+        roc_auc=roc_auc,
+    )
+    logger.info(
+        "[%s] WALK-FORWARD OOS (n=%d): MAE=%.6f DirAcc=%.3f Acc=%.3f AUC=%.3f",
+        ticker, result.n_oos, result.mae, result.directional_accuracy,
+        result.accuracy, result.roc_auc,
+    )
+    return result
+
+
+def walk_forward_eval_summary(
+    long: "pd.DataFrame",
+    tickers: list[str],
+    engine: str = "linear",
+) -> "pd.DataFrame":
+    """Run :func:`walk_forward_evaluation` across tickers and tabulate/save it."""
+    rows = [walk_forward_evaluation(long, t, engine=engine) for t in tickers]
+    df = pd.DataFrame([asdict(r) for r in rows]).set_index("ticker")
+    print(banner("ROBUSTNESS — WALK-FORWARD (ROLLING-RETRAIN) OOS METRICS"))
+    print(df.round(4).to_string())
+    config.ensure_dirs()
+    df.to_csv(config.REPORT_DIR / "walk_forward_evaluation.csv")
+    logger.info("Saved walk-forward eval → %s", config.REPORT_DIR / "walk_forward_evaluation.csv")
+    return df

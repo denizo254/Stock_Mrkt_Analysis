@@ -31,6 +31,7 @@ benchmarked end-to-end against the S&P 500.
 | **3** | **SHAP explainability** (TreeExplainer) + native gain/weight/cover — ranks which indicators carry signal vs noise; exports plots + CSVs | `evaluation.py` |
 | **4** | **Streamlit dashboard** — interactive Plotly equity curve vs SPY, rolling allocations, efficient frontier, live scorecards | `app.py` |
 | **5** | **Signal-driven allocation** — walk-forward (periodic-refit) out-of-sample model predictions feed the optimiser as a time-varying μ (`signal_mu_provider`) or tilt a base allocation (`signal_tilt_transform`); backtested vs pure-MPT vs SPY. Strictly no look-ahead (proven by test). | `signals.py` |
+| **6** | **Robustness layer** — Ledoit-Wolf covariance shrinkage; risk overlays (per-name position cap via water-filling, volatility targeting with a cash leg, drawdown stop); and honest walk-forward (rolling-retrain) OOS model metrics. All overlays opt-in; OFF reduces exactly to baseline (tested). | `portfolio_optimization.py`, `evaluation.py` |
 
 ---
 
@@ -96,6 +97,11 @@ python main.py --rebalance-freq Q       # quarterly (vs default monthly) rebalan
 python main.py --no-shap                # native gain importances instead of SHAP
 python main.py --signal-driven          # add model-signal strategies to the backtest
 python main.py --signal-driven --signal-engine xgboost   # (slower) tree-based signal
+python main.py --shrinkage              # Ledoit-Wolf covariance in the backtest
+python main.py --target-vol 0.15        # volatility-targeting overlay (15% annual)
+python main.py --max-weight 0.35        # cap any single position at 35%
+python main.py --drawdown-stop 0.25     # de-risk to cash on a 25% drawdown
+python main.py --wf-eval                # honest walk-forward (rolling-retrain) metrics
 python main.py --refresh --verbose      # re-download + DEBUG logging
 ```
 

@@ -41,6 +41,7 @@ from src.evaluation import (
     explain_model,
     plot_confusion_matrix,
     plot_roc_curve,
+    walk_forward_eval_summary,
 )
 from src.feature_engineering import build_features_for_ticker, feature_columns
 from src.modeling import predict_regression, train_classifier, train_regressor
@@ -78,6 +79,17 @@ def parse_args() -> argparse.Namespace:
                         "to the dynamic backtest comparison.")
     p.add_argument("--signal-engine", choices=["linear", "xgboost"], default="linear",
                    help="Model engine for the walk-forward signal (default: linear, fast).")
+    # --- robustness overlays ---
+    p.add_argument("--shrinkage", action="store_true",
+                   help="Use Ledoit-Wolf covariance shrinkage in the rolling backtest.")
+    p.add_argument("--max-weight", type=float, default=None,
+                   help="Per-name position cap for the rolling backtest, e.g. 0.35.")
+    p.add_argument("--target-vol", type=float, default=None,
+                   help="Annualised volatility target (vol-targeting overlay), e.g. 0.15.")
+    p.add_argument("--drawdown-stop", type=float, default=None,
+                   help="De-risk to cash when drawdown exceeds this, e.g. 0.25.")
+    p.add_argument("--wf-eval", action="store_true",
+                   help="Run honest walk-forward (rolling-retrain) OOS model evaluation.")
     p.add_argument("--verbose", action="store_true", help="DEBUG-level logging.")
     return p.parse_args()
 
@@ -131,6 +143,12 @@ def run_modeling_stage(
     return model_implied_mu
 
 
+def run_walk_forward_eval(long, tickers, engine, logger):
+    """Honest rolling-retrain OOS model evaluation (robustness diagnostic)."""
+    logger.info(banner("ROBUSTNESS — WALK-FORWARD MODEL EVALUATION"))
+    walk_forward_eval_summary(long, tickers, engine=engine)
+
+
 def main() -> None:
     args = parse_args()
     config.ensure_dirs()
@@ -162,6 +180,10 @@ def main() -> None:
     if not args.skip_models:
         model_implied_mu = run_modeling_stage(long, args.tickers, logger)
 
+    # ---- Robustness: honest walk-forward (rolling-retrain) OOS metrics ----
+    if args.wf_eval:
+        run_walk_forward_eval(long, args.tickers, args.signal_engine, logger)
+
     # ---- Phase 5(b): portfolio optimization -------------------------------
     mu_override = None
     if args.model_implied_mu and model_implied_mu:
@@ -185,14 +207,24 @@ def main() -> None:
 
     # ---- Phase 5(d): DYNAMIC rolling rebalancing backtest (Step 2) --------
     logger.info(banner("PHASE 5 — DYNAMIC ROLLING REBALANCING BACKTEST"))
+    # Robustness overlays (all opt-in via CLI; default off => baseline behaviour).
+    overlay_kw = dict(
+        cov_method="ledoit_wolf" if args.shrinkage else config.PORTFOLIO.cov_method,
+        max_weight=args.max_weight,
+        target_vol=args.target_vol,
+        drawdown_stop=args.drawdown_stop,
+    )
+    if any([args.shrinkage, args.max_weight, args.target_vol, args.drawdown_stop]):
+        logger.info("Risk overlays active: %s", overlay_kw)
+
     backtests = {
         "Max Sharpe": rolling_rebalance_backtest(
             long, tickers=args.tickers, strategy="max_sharpe",
-            frequency=args.rebalance_freq, mu_override=mu_override,
+            frequency=args.rebalance_freq, mu_override=mu_override, **overlay_kw,
         ),
         "Min Variance": rolling_rebalance_backtest(
             long, tickers=args.tickers, strategy="min_variance",
-            frequency=args.rebalance_freq,
+            frequency=args.rebalance_freq, **overlay_kw,
         ),
     }
 
