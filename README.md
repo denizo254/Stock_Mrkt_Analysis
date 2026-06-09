@@ -112,9 +112,28 @@ streamlit run app.py
 ```
 
 Pick the universe, rebalancing frequency, estimation lookback, transaction
-cost, and strategy in the sidebar, then click **Run analysis** to render the
-dynamic equity curve vs SPY, rolling allocations, the efficient frontier, and
-the risk-adjusted scorecard — all interactive Plotly.
+cost, strategy, and **robustness overlays** (Ledoit-Wolf shrinkage, position
+cap, vol targeting, drawdown stop) in the sidebar, then click **Run analysis**
+to render the dynamic equity curve vs SPY, rolling allocations, the efficient
+frontier, and the risk-adjusted scorecard — all interactive Plotly.
+
+### Deploy to Streamlit Community Cloud (free)
+
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/deploy?repository=denizo254/Stock_Mrkt_Analysis&branch=main&mainModule=app.py)
+
+1. Push the repo to GitHub (already at `denizo254/Stock_Mrkt_Analysis`).
+2. Go to **https://share.streamlit.io** and sign in with GitHub.
+3. **Create app → Deploy a public app from GitHub** and set:
+   - **Repository:** `denizo254/Stock_Mrkt_Analysis`
+   - **Branch:** `main`
+   - **Main file path:** `app.py`
+   - *(Advanced settings → Python 3.11 or 3.12)*
+4. Click **Deploy**. The first build installs `requirements.txt` (a few
+   minutes — it includes the ML stack); subsequent loads are fast. Your app
+   gets a public URL like `https://<app-name>.streamlit.app`.
+
+The included `.streamlit/config.toml` already sets a production-friendly theme
+and headless server config. Pushes to `main` auto-redeploy.
 
 ---
 

@@ -1,0 +1,14 @@
+# Streamlit configuration — applies locally and on Streamlit Community Cloud.
+
+[theme]
+base = "light"
+primaryColor = "#2c7fb8"          # matches the project's plot palette
+font = "sans serif"
+
+[server]
+headless = true                   # no auto-open browser (correct for servers)
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

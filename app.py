@@ -79,6 +79,10 @@ def run_backtest(
     frequency: str,
     lookback_days: int,
     cost_bps: float,
+    cov_method: str = "sample",
+    max_weight: float | None = None,
+    target_vol: float | None = None,
+    drawdown_stop: float | None = None,
 ):
     """Cached rolling backtest; returns a plain dict so it is cache-friendly."""
     long = load_data(symbols, start, end)
@@ -89,6 +93,10 @@ def run_backtest(
         frequency=frequency,
         lookback_days=lookback_days,
         cost_rate=cost_bps / 10_000.0,
+        cov_method=cov_method,
+        max_weight=max_weight,
+        target_vol=target_vol,
+        drawdown_stop=drawdown_stop,
     )
     return {
         "equity_curve": bt.equity_curve,
@@ -97,6 +105,8 @@ def run_backtest(
         "turnover": bt.turnover,
         "total_cost": bt.total_cost,
         "n_rebalances": bt.n_rebalances,
+        "exposure": bt.exposure,
+        "n_stops": bt.n_stops,
     }
 
 
@@ -154,11 +164,21 @@ cost_bps = st.sidebar.slider("Transaction cost (basis points)", 0.0, 25.0,
                              config.REBALANCE.transaction_cost_bps, step=0.5)
 
 start_date = st.sidebar.date_input("Start date", value=pd.Timestamp(config.START_DATE))
-use_model_mu = st.sidebar.checkbox(
-    "Use model-implied μ (slower)", value=False,
-    help="Train models to estimate expected returns instead of historical mean. "
-         "Demonstrative hook — uses a static override in the dashboard.",
-)
+
+# --- Robustness overlays (opt-in; sliders at their min/max mean "off") ------
+with st.sidebar.expander("🛡️ Robustness overlays"):
+    use_shrinkage = st.checkbox(
+        "Ledoit-Wolf covariance", value=False,
+        help="Shrinkage estimator → stabler, less extreme weights.",
+    )
+    max_w = st.slider("Max weight per name (1.00 = off)", 0.20, 1.0, 1.0, 0.05)
+    tgt_vol = st.slider("Target volatility (0 = off)", 0.0, 0.40, 0.0, 0.01)
+    dd_stop = st.slider("Drawdown stop (0 = off)", 0.0, 0.50, 0.0, 0.05)
+
+cov_method = "ledoit_wolf" if use_shrinkage else "sample"
+max_weight = max_w if max_w < 1.0 else None
+target_vol = tgt_vol if tgt_vol > 0 else None
+drawdown_stop = dd_stop if dd_stop > 0 else None
 
 run = st.sidebar.button("🚀 Run analysis", type="primary", use_container_width=True)
 
@@ -191,9 +211,21 @@ frequency = FREQ_MAP[freq_label]
 
 long = load_data(symbols, start_str, None)
 
-# --- run both strategies for a fair comparison on the equity panel ---------
+# --- run the selected strategy through the rolling backtest ----------------
 bt_primary = run_backtest(symbols, tickers_t, start_str, None, strategy,
-                          frequency, lookback, cost_bps)
+                          frequency, lookback, cost_bps,
+                          cov_method=cov_method, max_weight=max_weight,
+                          target_vol=target_vol, drawdown_stop=drawdown_stop)
+
+_active = [n for n, on in [
+    ("Ledoit-Wolf", use_shrinkage), (f"cap {max_w:.0%}", max_weight is not None),
+    (f"vol-target {tgt_vol:.0%}", target_vol is not None),
+    (f"DD-stop {dd_stop:.0%}", drawdown_stop is not None),
+] if on]
+if _active:
+    st.info("🛡️ Active risk overlays: " + ", ".join(_active)
+            + (f"  ·  drawdown stop triggered {bt_primary['n_stops']}×"
+               if drawdown_stop is not None else ""))
 
 # ===========================================================================
 # Panel 1 — Dynamic equity curve vs SPY
