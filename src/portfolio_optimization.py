@@ -425,6 +425,8 @@ def rolling_rebalance_backtest(
     rolling_lookback: bool = config.REBALANCE.rolling_lookback,
     cost_rate: float = config.REBALANCE.cost_rate,
     mu_override: pd.Series | None = None,
+    mu_provider=None,
+    weight_transform=None,
 ) -> RollingBacktestResult:
     """
     Walk-forward portfolio backtest with periodic rebalancing + trading costs.
@@ -443,6 +445,18 @@ def rolling_rebalance_backtest(
        until the following rebalance. At each rebalance we charge
        ``turnover × cost_rate`` as a same-day return drag, where turnover is
        ``Σ|w_target − w_drifted|`` (full traded volume, buys + sells).
+
+    Signal hooks (Step: signal-driven allocation)
+    ---------------------------------------------
+    ``mu_provider`` : optional ``callable(date, window_log_returns) -> Series``.
+        When supplied it supersedes the historical mean / ``mu_override`` for
+        the expected-return vector at each rebalance. Returning ``None`` (or a
+        vector with NaNs) falls back to the historical mean. This is how a
+        model-derived expected-return signal is injected WITHOUT look-ahead —
+        the provider only ever receives data up to ``date``.
+    ``weight_transform`` : optional ``callable(date, base_weights, window) ->
+        Series``. Applied to the optimiser's output to tilt the allocation
+        (e.g. overweight high-signal names) before it is held.
 
     Returns a :class:`RollingBacktestResult` with the net & gross equity
     curves, the full weight history, and turnover/cost diagnostics.
@@ -465,9 +479,23 @@ def rolling_rebalance_backtest(
             window = window.tail(lookback_days)
         if len(window) < min_obs:
             continue
-        mu = mu_override.reindex(tickers) if mu_override is not None else annualised_mean(window)
+
+        # Expected-return vector μ — provider (signal) > static override > history.
+        mu = None
+        if mu_provider is not None:
+            mu = mu_provider(d, window)
+        elif mu_override is not None:
+            mu = mu_override.reindex(tickers)
+        if mu is None or pd.Series(mu).reindex(tickers).isna().any():
+            mu = annualised_mean(window)          # robust fallback
+        else:
+            mu = pd.Series(mu).reindex(tickers)
+
         cov = annualised_cov(window)
-        targets[d] = _optimise_weights(strategy, mu, cov).reindex(tickers).fillna(0.0)
+        w = _optimise_weights(strategy, mu, cov).reindex(tickers).fillna(0.0)
+        if weight_transform is not None:
+            w = pd.Series(weight_transform(d, w, window)).reindex(tickers).fillna(0.0)
+        targets[d] = w
 
     if not targets:
         raise RuntimeError(

@@ -50,6 +50,7 @@ from src.performance import (
     plot_dynamic_equity_curves,
 )
 from src.portfolio_optimization import optimize_portfolio, rolling_rebalance_backtest
+from src.signals import run_signal_strategies
 from src.utils import banner, configure_logging, get_logger
 
 
@@ -72,6 +73,11 @@ def parse_args() -> argparse.Namespace:
                    help="Rolling rebalancing frequency: M=monthly, Q=quarterly.")
     p.add_argument("--no-shap", action="store_true",
                    help="Disable SHAP explainability (use native gain only).")
+    p.add_argument("--signal-driven", action="store_true",
+                   help="Add walk-forward signal-driven strategies (model μ + tilt) "
+                        "to the dynamic backtest comparison.")
+    p.add_argument("--signal-engine", choices=["linear", "xgboost"], default="linear",
+                   help="Model engine for the walk-forward signal (default: linear, fast).")
     p.add_argument("--verbose", action="store_true", help="DEBUG-level logging.")
     return p.parse_args()
 
@@ -189,6 +195,15 @@ def main() -> None:
             frequency=args.rebalance_freq,
         ),
     }
+
+    # ---- Phase 5(e): SIGNAL-DRIVEN allocation (models -> optimizer) -------
+    if args.signal_driven:
+        signal_bts, _ = run_signal_strategies(
+            long, tickers=args.tickers, frequency=args.rebalance_freq,
+            engine=args.signal_engine,
+        )
+        backtests.update(signal_bts)
+
     dynamic_benchmark_report(long, backtests)
     plot_dynamic_equity_curves(long, backtests)
 

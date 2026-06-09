@@ -30,6 +30,7 @@ benchmarked end-to-end against the S&P 500.
 | **2** | **Dynamic rolling rebalancing engine** — monthly/quarterly re-optimisation on trailing windows, drifting weights, **transaction-cost drag (5–10 bps on turnover)**, compounding net equity curve | `portfolio_optimization.py`, `performance.py` |
 | **3** | **SHAP explainability** (TreeExplainer) + native gain/weight/cover — ranks which indicators carry signal vs noise; exports plots + CSVs | `evaluation.py` |
 | **4** | **Streamlit dashboard** — interactive Plotly equity curve vs SPY, rolling allocations, efficient frontier, live scorecards | `app.py` |
+| **5** | **Signal-driven allocation** — walk-forward (periodic-refit) out-of-sample model predictions feed the optimiser as a time-varying μ (`signal_mu_provider`) or tilt a base allocation (`signal_tilt_transform`); backtested vs pure-MPT vs SPY. Strictly no look-ahead (proven by test). | `signals.py` |
 
 ---
 
@@ -51,6 +52,7 @@ Stock Market Analysis/
 │   ├── feature_engineering.py    # Phase 3 — indicators from first principles
 │   ├── data_splitting.py         # Phase 3 — chronological / TimeSeriesSplit
 │   ├── modeling.py               # Phase 4 — dual model + CV tuning
+│   ├── signals.py                # Bridge — walk-forward signal-driven allocation
 │   ├── evaluation.py             # Phase 5 — predictive metrics & plots
 │   ├── portfolio_optimization.py # Phase 5 — MPT engine (SciPy)
 │   └── performance.py            # Phase 5 — Sharpe/Sortino/Drawdown vs SPY
@@ -92,6 +94,8 @@ python main.py --skip-models            # data + EDA + optimization only (fast)
 python main.py --model-implied-mu       # feed model-predicted returns into the optimizer
 python main.py --rebalance-freq Q       # quarterly (vs default monthly) rebalancing
 python main.py --no-shap                # native gain importances instead of SHAP
+python main.py --signal-driven          # add model-signal strategies to the backtest
+python main.py --signal-driven --signal-engine xgboost   # (slower) tree-based signal
 python main.py --refresh --verbose      # re-download + DEBUG logging
 ```
 
