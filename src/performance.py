@@ -34,6 +34,10 @@ logger = get_logger("performance")
 TD = config.TRADING_DAYS_PER_YEAR
 RF = config.RISK_FREE_RATE
 
+# Volatilities below this are treated as zero (degenerate / constant series),
+# guarding the risk-adjusted ratios against floating-point division blow-ups.
+_ZERO_TOL = 1e-12
+
 
 # ===========================================================================
 # Building a portfolio return stream
@@ -86,7 +90,10 @@ def sharpe_ratio(returns: pd.Series, risk_free: float = RF) -> float:
     """Annualised Sharpe ratio using a daily-decomposed risk-free rate."""
     excess = returns - risk_free / TD
     denom = excess.std(ddof=0)
-    if denom == 0:
+    # Use a tolerance, not an exact == 0 check: a (near-)constant series yields
+    # a tiny floating-point std (~1e-18), which would otherwise blow the ratio
+    # up to ~1e16 instead of the intended 0.
+    if denom < _ZERO_TOL:
         return 0.0
     return float(excess.mean() / denom * np.sqrt(TD))
 
@@ -99,7 +106,7 @@ def sortino_ratio(returns: pd.Series, risk_free: float = RF) -> float:
     excess = returns - risk_free / TD
     downside = excess[excess < 0]
     downside_dev = np.sqrt((downside ** 2).mean()) if len(downside) else 0.0
-    if downside_dev == 0:
+    if downside_dev < _ZERO_TOL:
         return 0.0
     return float(excess.mean() / downside_dev * np.sqrt(TD))
 
