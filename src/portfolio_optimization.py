@@ -518,13 +518,39 @@ def rolling_rebalance_backtest(
     curves, the full weight history, and turnover/cost diagnostics.
     """
     tickers = tickers or config.TICKERS
+
+    # Validate the requested tickers actually came back from the data source.
+    # (On a throttled / partial download some symbols can be missing entirely;
+    # surfacing that here beats a cryptic empty-result error downstream.)
+    available = set(get_price_panel(long, "Adj Close").columns)
+    missing = [t for t in tickers if t not in available]
+    if missing:
+        raise RuntimeError(
+            f"Price data missing for {missing}. The data source may have "
+            f"returned a partial result (e.g. Yahoo rate-limiting). "
+            f"Available: {sorted(available)}."
+        )
+
     panel = get_price_panel(long, "Adj Close")[tickers].dropna()
     simple = panel.pct_change().dropna()
     log_ret = np.log(panel / panel.shift(1)).dropna()
     all_dates = simple.index
 
+    # Minimum observations for a usable covariance estimate. We require a
+    # modest floor (≈3 months) rather than a full lookback window, so a short
+    # or partially-downloaded history still produces a valid (if shorter)
+    # backtest instead of failing outright. The trailing .tail(lookback_days)
+    # below still yields a true rolling window once enough history accrues.
+    min_obs = max(len(tickers) + 2, 60)
+    if len(log_ret) < min_obs:
+        raise RuntimeError(
+            f"Only {len(log_ret)} usable return rows for {tickers} "
+            f"({all_dates.min().date() if len(all_dates) else 'n/a'} → "
+            f"{all_dates.max().date() if len(all_dates) else 'n/a'}); need ≥ "
+            f"{min_obs}. Widen the date range or check the data download."
+        )
+
     rebal_dates = _rebalance_dates(all_dates, frequency)
-    min_obs = lookback_days if rolling_lookback else max(len(tickers) + 2, 21)
 
     # ---- 1. Pre-compute target weights at each valid rebalance date --------
     targets: dict[pd.Timestamp, pd.Series] = {}
@@ -566,8 +592,10 @@ def rolling_rebalance_backtest(
 
     if not targets:
         raise RuntimeError(
-            "No rebalance date had enough history. Lower lookback_days or "
-            "widen the date range."
+            f"No rebalance date had enough history (need ≥ {min_obs} rows; "
+            f"have {len(log_ret)} over {len(rebal_dates)} candidate "
+            f"{frequency}-end dates). Widen the date range or lower the "
+            f"rebalancing frequency."
         )
 
     # Map each target (weights + exposure) to the day it becomes active.

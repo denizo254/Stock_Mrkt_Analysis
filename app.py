@@ -209,13 +209,23 @@ start_str = pd.Timestamp(start_date).strftime("%Y-%m-%d")
 strategy = STRATEGY_MAP[strategy_label]
 frequency = FREQ_MAP[freq_label]
 
-long = load_data(symbols, start_str, None)
-
-# --- run the selected strategy through the rolling backtest ----------------
-bt_primary = run_backtest(symbols, tickers_t, start_str, None, strategy,
-                          frequency, lookback, cost_bps,
-                          cov_method=cov_method, max_weight=max_weight,
-                          target_vol=target_vol, drawdown_stop=drawdown_stop)
+try:
+    long = load_data(symbols, start_str, None)
+    # --- run the selected strategy through the rolling backtest ------------
+    bt_primary = run_backtest(symbols, tickers_t, start_str, None, strategy,
+                              frequency, lookback, cost_bps,
+                              cov_method=cov_method, max_weight=max_weight,
+                              target_vol=target_vol, drawdown_stop=drawdown_stop)
+except Exception as exc:  # noqa: BLE001 — surface any data/compute issue cleanly
+    st.error(
+        "⚠️ Could not complete the analysis.\n\n"
+        f"**{type(exc).__name__}:** {exc}\n\n"
+        "This is most often a market-data issue — the free Yahoo Finance "
+        "endpoint can rate-limit cloud hosts and return little or no data. "
+        "Try: a **wider date range**, **fewer tickers**, or simply **re-run** "
+        "in a minute. (Locally the data is cached, so it is reliable there.)"
+    )
+    st.stop()
 
 _active = [n for n, on in [
     ("Ledoit-Wolf", use_shrinkage), (f"cap {max_w:.0%}", max_weight is not None),
@@ -280,7 +290,11 @@ st.plotly_chart(fig_w, use_container_width=True)
 # ===========================================================================
 st.subheader("3 · Efficient Frontier (full-sample mean-variance)")
 
-front = run_frontier(symbols, tickers_t, start_str, None)
+try:
+    front = run_frontier(symbols, tickers_t, start_str, None)
+except Exception as exc:  # noqa: BLE001
+    st.warning(f"Efficient frontier unavailable ({type(exc).__name__}: {exc}).")
+    st.stop()
 frontier = front["frontier"]
 ms, mv = front["max_sharpe"], front["min_variance"]
 

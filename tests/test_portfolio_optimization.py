@@ -124,6 +124,15 @@ def test_rolling_backtest_structural_invariants(synthetic_long):
     assert (bt.equity_curve > 0).all()
 
 
+def test_rolling_backtest_rejects_missing_ticker(synthetic_long):
+    """A requested symbol absent from the data raises a clear, early error
+    rather than failing cryptically deep in the simulation (cloud robustness)."""
+    with pytest.raises(RuntimeError, match="missing"):
+        rolling_rebalance_backtest(
+            synthetic_long, tickers=["AAPL", "DOES_NOT_EXIST"], frequency="M"
+        )
+
+
 def test_rolling_backtest_zero_cost_equals_gross(synthetic_long):
     """With a 0 bps cost the net and gross equity curves must coincide."""
     bt = rolling_rebalance_backtest(
