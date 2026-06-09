@@ -32,7 +32,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 import config
-from src.data_splitting import SplitData, make_ts_cv
+from src.data_splitting import SplitData, make_walk_forward_cv
 from src.utils import get_logger, timed
 
 logger = get_logger("modeling")
@@ -51,29 +51,52 @@ except ImportError:  # pragma: no cover
 # ===========================================================================
 # Estimator + hyper-parameter grid factories
 # ===========================================================================
+def _regularised_xgb_grid() -> dict:
+    """
+    Heavily-regularised XGBoost search grid shared by both tasks (Step 1).
+
+    Rationale — daily equity signals are dominated by noise, so we fight
+    overfitting on every available axis:
+      * ``max_depth`` ∈ {1,2,3}      — very shallow trees (weak learners).
+      * ``reg_alpha`` (L1)            — drives weak feature weights to zero.
+      * ``reg_lambda`` (L2)           — shrinks leaf weights smoothly.
+      * ``gamma`` > 0                 — refuses splits that don't cut loss enough.
+    ``subsample`` / ``colsample_bytree`` are FIXED at 0.7 on the estimator to
+    force row/feature diversification, and are therefore not part of the grid.
+    """
+    m = config.MODEL
+    return {
+        "max_depth": list(m.max_depth_grid),
+        "learning_rate": list(m.learning_rate_grid),
+        "reg_alpha": list(m.reg_alpha_grid),
+        "reg_lambda": list(m.reg_lambda_grid),
+        "gamma": list(m.gamma_grid),
+    }
+
+
+def _xgb_common_kwargs() -> dict:
+    """Fixed XGBoost constructor kwargs (structural regularisation)."""
+    m = config.MODEL
+    return dict(
+        n_estimators=m.n_estimators,
+        subsample=m.subsample,
+        colsample_bytree=m.colsample_bytree,
+        random_state=m.random_state,
+        n_jobs=-1,
+        tree_method="hist",
+    )
+
+
 def _build_regressor(engine: str) -> tuple[object, dict]:
     """Return an (estimator, param_grid) pair for the regression task."""
     if engine == "xgboost" and _HAS_XGB:
-        est = XGBRegressor(
-            objective="reg:squarederror",
-            random_state=config.MODEL.random_state,
-            n_jobs=-1,
-            tree_method="hist",
-        )
-        grid = {
-            "n_estimators": [200, 400],
-            "max_depth": [2, 3, 4],
-            "learning_rate": [0.01, 0.05],
-            "subsample": [0.8, 1.0],
-            "colsample_bytree": [0.8, 1.0],
-        }
-        return est, grid
+        est = XGBRegressor(objective="reg:squarederror", **_xgb_common_kwargs())
+        return est, _regularised_xgb_grid()
 
     # Linear fallback: standardise then Ridge. A Pipeline keeps scaling inside
-    # the CV loop so validation folds are never used to fit the scaler.
-    est = Pipeline(
-        [("scaler", StandardScaler()), ("model", Ridge(random_state=None))]
-    )
+    # the CV loop so validation folds are never used to fit the scaler. Ridge's
+    # alpha is itself an L2 penalty, so the linear path is regularised too.
+    est = Pipeline([("scaler", StandardScaler()), ("model", Ridge())])
     grid = {"model__alpha": [0.01, 0.1, 1.0, 10.0, 100.0]}
     return est, grid
 
@@ -84,18 +107,9 @@ def _build_classifier(engine: str) -> tuple[object, dict]:
         est = XGBClassifier(
             objective="binary:logistic",
             eval_metric="logloss",
-            random_state=config.MODEL.random_state,
-            n_jobs=-1,
-            tree_method="hist",
+            **_xgb_common_kwargs(),
         )
-        grid = {
-            "n_estimators": [200, 400],
-            "max_depth": [2, 3, 4],
-            "learning_rate": [0.01, 0.05],
-            "subsample": [0.8, 1.0],
-            "colsample_bytree": [0.8, 1.0],
-        }
-        return est, grid
+        return est, _regularised_xgb_grid()
 
     est = Pipeline(
         [
@@ -161,9 +175,9 @@ def train_regressor(
 ) -> TrainedModel:
     """Tune + fit the next-day log-return regressor on the training split."""
     est, grid = _build_regressor(engine)
-    cv = make_ts_cv()
+    cv = make_walk_forward_cv()  # rolling walk-forward folds (Step 1)
 
-    with timed(f"[{ticker}] regression grid-search ({engine})", logger):
+    with timed(f"[{ticker}] regression WFV grid-search ({engine})", logger):
         search = GridSearchCV(
             estimator=est,
             param_grid=grid,
@@ -171,6 +185,7 @@ def train_regressor(
             cv=cv,
             n_jobs=-1,
             refit=True,
+            error_score=np.nan,  # a degenerate fold should not kill the search
         )
         search.fit(split.X_train, split.y_train)
 
@@ -199,9 +214,9 @@ def train_classifier(
 ) -> TrainedModel:
     """Tune + fit the next-day direction classifier on the training split."""
     est, grid = _build_classifier(engine)
-    cv = make_ts_cv()
+    cv = make_walk_forward_cv()  # rolling walk-forward folds (Step 1)
 
-    with timed(f"[{ticker}] classification grid-search ({engine})", logger):
+    with timed(f"[{ticker}] classification WFV grid-search ({engine})", logger):
         search = GridSearchCV(
             estimator=est,
             param_grid=grid,
@@ -209,6 +224,7 @@ def train_classifier(
             cv=cv,
             n_jobs=-1,
             refit=True,
+            error_score=np.nan,  # a single-class test fold should not abort tuning
         )
         search.fit(split.X_train, split.y_train)
 

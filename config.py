@@ -107,16 +107,72 @@ class ModelConfig:
     # Fraction of the (chronological) sample reserved for the final hold-out
     # test. The remainder is used for walk-forward CV + validation.
     test_size: float = 0.2
-    # Number of expanding-window folds for TimeSeriesSplit during tuning.
-    n_splits: int = 5
     # Reproducibility.
     random_state: int = 42
     # Which engine to use. "xgboost" or "linear" (Ridge / LogisticRegression).
     regressor: str = "xgboost"
     classifier: str = "xgboost"
 
+    # --- Anti-overfitting structural defaults (Step 1) ---------------------
+    # Aggressive row/column subsampling forces the trees to diversify across
+    # features and decorrelates the ensemble — the single most effective lever
+    # against fitting market microstructure noise. These are FIXED on the
+    # estimator; the regularisation penalties below are what we TUNE.
+    subsample: float = 0.7
+    colsample_bytree: float = 0.7
+    n_estimators: int = 300
+
+    # --- Hyper-parameter search grids (heavily regularised) ----------------
+    # Shallow trees + L1 (alpha) + L2 (lambda) + split-gain penalty (gamma>0).
+    # Kept deliberately compact so a walk-forward grid search stays tractable.
+    max_depth_grid: tuple[int, ...] = (1, 2, 3)
+    learning_rate_grid: tuple[float, ...] = (0.01, 0.05)
+    reg_alpha_grid: tuple[float, ...] = (0.0, 1.0)        # L1
+    reg_lambda_grid: tuple[float, ...] = (1.0, 10.0)      # L2
+    gamma_grid: tuple[float, ...] = (0.1, 1.0)            # min split loss > 0
+
 
 MODEL = ModelConfig()
+
+
+# ---------------------------------------------------------------------------
+# Walk-Forward Validation (Phase 4, Step 1)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class WalkForwardConfig:
+    """
+    Rolling walk-forward cross-validation geometry.
+
+    Windows are expressed in calendar months and converted to a sample count
+    via ``trading_days_per_month``. A 12-month train / 1-month test window that
+    rolls forward one month at a time emulates how a desk actually re-fits a
+    model in production.
+    """
+
+    train_months: int = 12
+    test_months: int = 1
+    step_months: int = 1
+    trading_days_per_month: int = 21      # ~252 / 12
+    rolling: bool = True                  # True = fixed rolling window; False = anchored/expanding
+    # During hyper-parameter search a full step-by-step WFV can produce dozens
+    # of folds (≈ one per month of history), which makes the grid search slow.
+    # Cap the search to the most-recent N folds (the regime that matters most).
+    cv_max_splits: int = 8
+
+    @property
+    def train_size(self) -> int:
+        return self.train_months * self.trading_days_per_month
+
+    @property
+    def test_size(self) -> int:
+        return self.test_months * self.trading_days_per_month
+
+    @property
+    def step_size(self) -> int:
+        return self.step_months * self.trading_days_per_month
+
+
+WALK_FORWARD = WalkForwardConfig()
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +190,49 @@ class PortfolioConfig:
 
 
 PORTFOLIO = PortfolioConfig()
+
+
+# ---------------------------------------------------------------------------
+# Dynamic rolling rebalancing engine (Phase 5, Step 2)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class RebalanceConfig:
+    """
+    Configuration for the walk-forward portfolio backtest.
+
+    At each rebalancing date the optimiser re-estimates μ and Σ using ONLY the
+    trailing ``lookback_days`` of returns (strictly before the rebalance date),
+    then holds the resulting weights until the next rebalance. Turnover at each
+    rebalance is charged ``transaction_cost_bps`` basis points.
+    """
+
+    frequency: str = "M"               # 'M' = month-end, 'Q' = quarter-end
+    lookback_days: int = 252           # trailing estimation window (1 trading year)
+    rolling_lookback: bool = True      # True = fixed window; False = expanding/anchored
+    transaction_cost_bps: float = 7.0  # 5–10 bps charged per unit of turnover
+    strategy: str = "max_sharpe"       # 'max_sharpe' | 'min_variance' | 'equal_weight'
+
+    @property
+    def cost_rate(self) -> float:
+        """Transaction cost as a decimal fraction (e.g. 7 bps -> 0.0007)."""
+        return self.transaction_cost_bps / 10_000.0
+
+
+REBALANCE = RebalanceConfig()
+
+
+# ---------------------------------------------------------------------------
+# Explainability / SHAP (Phase 5, Step 3)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ExplainConfig:
+    enable_shap: bool = True           # fall back to native gain if shap missing
+    shap_sample_size: int = 300        # rows sampled from the test set for SHAP
+    top_n_features: int = 20           # how many features to render in plots
+    random_state: int = 42
+
+
+EXPLAIN = ExplainConfig()
 
 
 # Default primary ticker used by single-asset demonstrations (modeling phase).

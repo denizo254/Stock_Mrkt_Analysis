@@ -233,3 +233,184 @@ def evaluation_summary(
     summary.to_csv(out)
     logger.info("Saved evaluation summary → %s", out)
     return summary
+
+
+# ===========================================================================
+# STEP 3 — FEATURE IMPORTANCE & EXPLAINABILITY (SHAP)
+# ===========================================================================
+# Goal: identify exactly which engineered features (RSI, volatility, beta,
+# lags, …) carry the predictive weight versus which are noise. We provide two
+# complementary views:
+#   1. Native XGBoost importances (gain / weight / cover) — fast, model-internal.
+#   2. SHAP values — game-theoretic per-feature attribution that is consistent
+#      and locally accurate. Falls back gracefully to native gain if `shap`
+#      is not installed.
+
+# Lazy / optional dependency.
+try:
+    import shap  # type: ignore
+
+    _HAS_SHAP = True
+except ImportError:  # pragma: no cover
+    _HAS_SHAP = False
+    logger.info("shap not installed — explainability will use native XGBoost gain.")
+
+
+def _underlying_booster(model: TrainedModel):
+    """Return the raw fitted estimator (unwrapping the linear Pipeline)."""
+    est = model.estimator
+    if hasattr(est, "named_steps"):           # linear Pipeline fallback
+        return est.named_steps["model"]
+    return est
+
+
+def native_xgb_importances(model: TrainedModel) -> pd.DataFrame:
+    """
+    Extract XGBoost importances by **gain**, **weight**, and **cover**.
+
+    * gain   — average loss reduction when the feature is used in a split
+               (the most faithful "predictive importance" measure).
+    * weight — number of times the feature is used to split.
+    * cover  — average number of samples affected by its splits.
+
+    Returns a DataFrame indexed by feature, sorted by gain (descending).
+    Works for the tree models; for the linear fallback it returns absolute
+    coefficients under a single 'gain' column.
+    """
+    booster_est = _underlying_booster(model)
+    names = model.feature_names
+
+    if not hasattr(booster_est, "get_booster"):
+        # Linear fallback: absolute standardised coefficients.
+        imp = model.feature_importance()
+        df = pd.DataFrame({"gain": imp.abs()}) if imp is not None else pd.DataFrame()
+        return df
+
+    booster = booster_est.get_booster()
+    booster.feature_names = list(names)
+    frames = {}
+    for kind in ("gain", "weight", "cover"):
+        scores = booster.get_score(importance_type=kind)
+        frames[kind] = pd.Series(scores)
+    df = pd.DataFrame(frames).reindex(names).fillna(0.0)
+    df = df.sort_values("gain", ascending=False)
+    return df
+
+
+def compute_shap_importance(
+    model: TrainedModel,
+    X: pd.DataFrame,
+    sample_size: int = config.EXPLAIN.shap_sample_size,
+) -> pd.Series | None:
+    """
+    Mean absolute SHAP value per feature (global importance).
+
+    A random sample of ``sample_size`` rows from ``X`` is used to keep the
+    TreeExplainer fast. Returns ``None`` (and logs) if shap is unavailable or
+    the estimator is not tree-based.
+    """
+    if not _HAS_SHAP:
+        return None
+    booster_est = _underlying_booster(model)
+    if not hasattr(booster_est, "get_booster"):
+        logger.info("[%s] SHAP skipped — not a tree model.", model.ticker)
+        return None
+
+    n = min(sample_size, len(X))
+    X_sample = X.sample(n=n, random_state=config.EXPLAIN.random_state) if n < len(X) else X
+
+    explainer = shap.TreeExplainer(booster_est)
+    shap_values = explainer.shap_values(X_sample)
+    # Binary classifiers may return a list (one array per class); take class 1.
+    if isinstance(shap_values, list):
+        shap_values = shap_values[-1]
+    mean_abs = np.abs(shap_values).mean(axis=0)
+    return pd.Series(mean_abs, index=model.feature_names).sort_values(ascending=False)
+
+
+def plot_feature_importance(
+    importance: pd.Series,
+    title: str,
+    filename: str,
+    top_n: int = config.EXPLAIN.top_n_features,
+    xlabel: str = "Importance",
+) -> str:
+    """Horizontal bar chart of the top-N most important features."""
+    config.ensure_dirs()
+    top = importance.head(top_n).iloc[::-1]  # reverse so largest is on top
+    fig, ax = plt.subplots(figsize=(8, max(4, 0.35 * len(top))))
+    ax.barh(top.index, top.values, color="#2c7fb8")
+    ax.set_xlabel(xlabel)
+    ax.set_title(title)
+    fig.tight_layout()
+    path = config.FIGURE_DIR / filename
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    logger.info("Saved feature-importance plot → %s", path)
+    return str(path)
+
+
+@dataclass
+class ExplainabilityResult:
+    ticker: str
+    task: str
+    method: str                     # "shap" | "native_gain"
+    importance: pd.Series           # ranked feature importances
+    native_table: pd.DataFrame      # gain/weight/cover (may be empty for linear)
+    figure_path: str
+    csv_path: str
+
+
+def explain_model(
+    model: TrainedModel,
+    X: pd.DataFrame,
+) -> ExplainabilityResult:
+    """
+    Full explainability pass for one trained model.
+
+    Prefers SHAP (if installed and tree-based); otherwise uses native XGBoost
+    gain. Exports a ranked CSV to ``outputs/reports`` and a bar plot to
+    ``outputs/figures``, and logs the top drivers vs the noise floor.
+    """
+    native = native_xgb_importances(model)
+
+    shap_imp = compute_shap_importance(model, X) if config.EXPLAIN.enable_shap else None
+    if shap_imp is not None:
+        method, importance = "shap", shap_imp
+        xlabel = "mean(|SHAP value|)"
+    else:
+        method = "native_gain"
+        importance = native["gain"] if "gain" in native else native.iloc[:, 0]
+        xlabel = "XGBoost gain"
+
+    fig_path = plot_feature_importance(
+        importance,
+        title=f"{model.ticker} {model.task} — feature importance ({method})",
+        filename=f"{model.ticker}_{model.task}_importance.png",
+        xlabel=xlabel,
+    )
+
+    config.ensure_dirs()
+    csv_path = config.REPORT_DIR / f"{model.ticker}_{model.task}_importance.csv"
+    export = importance.rename("importance").to_frame()
+    if not native.empty:
+        export = export.join(native, how="left")
+    export.to_csv(csv_path)
+
+    # Log the signal-vs-noise read.
+    top3 = ", ".join(importance.head(3).index)
+    bottom3 = ", ".join(importance.tail(3).index)
+    logger.info(
+        "[%s/%s] explainability (%s): top drivers = %s | noise floor = %s",
+        model.ticker, model.task, method, top3, bottom3,
+    )
+
+    return ExplainabilityResult(
+        ticker=model.ticker,
+        task=model.task,
+        method=method,
+        importance=importance,
+        native_table=native,
+        figure_path=fig_path,
+        csv_path=str(csv_path),
+    )

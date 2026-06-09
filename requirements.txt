@@ -23,6 +23,12 @@ matplotlib>=3.8
 seaborn>=0.13
 plotly>=5.20
 
+# Explainability (Step 3). Falls back to native XGBoost gain if absent.
+shap>=0.44
+
+# Interactive dashboard (Step 4)
+streamlit>=1.33
+
 # Nice-to-have: progress + tabular reports
 tqdm>=4.66
 tabulate>=0.9

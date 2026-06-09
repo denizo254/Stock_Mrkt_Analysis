@@ -189,3 +189,101 @@ def benchmark_report(
     report.to_csv(config.REPORT_DIR / "portfolio_performance.csv")
     logger.info("Saved performance scorecard → %s", config.REPORT_DIR / "portfolio_performance.csv")
     return report
+
+
+# ===========================================================================
+# STEP 2 — Dynamic (rolling backtest) performance vs benchmark
+# ===========================================================================
+def _spy_returns_on(index: pd.DatetimeIndex, long: pd.DataFrame) -> pd.Series:
+    """SPY daily simple returns reindexed onto the backtest's date range."""
+    spy = benchmark_return_series(long)
+    return spy.reindex(index).dropna()
+
+
+def dynamic_benchmark_report(
+    long: pd.DataFrame,
+    backtests: dict[str, "object"],
+) -> pd.DataFrame:
+    """
+    Score one or more rolling-backtest equity curves against SPY over the
+    SAME out-of-sample window.
+
+    Parameters
+    ----------
+    backtests : mapping label → ``RollingBacktestResult`` (kept loosely typed
+        to avoid a circular import with ``portfolio_optimization``).
+
+    Returns a scorecard DataFrame (rows = strategies + SPY). The strategy
+    metrics are net of transaction costs, so this is a like-for-like,
+    cost-aware comparison.
+    """
+    logger.info(banner("PHASE 5 — DYNAMIC ROLLING PORTFOLIO vs S&P 500"))
+
+    cards: list[PerformanceScorecard] = []
+    # Use the union of backtest dates to align the benchmark window.
+    all_index = None
+    for label, bt in backtests.items():
+        rets = bt.daily_returns
+        cards.append(score(rets, f"{label} (net)"))
+        all_index = rets.index if all_index is None else all_index.union(rets.index)
+
+    spy_rets = _spy_returns_on(all_index, long)
+    cards.append(score(spy_rets, f"{config.BENCHMARK} (benchmark)"))
+
+    report = pd.DataFrame([asdict(c) for c in cards]).set_index("label")
+
+    print(banner("Dynamic risk-adjusted scorecard (net of costs)"))
+    pretty = report.copy()
+    for col in ["ann_return", "ann_volatility", "max_drawdown"]:
+        pretty[col] = pretty[col].map(lambda x: f"{x:6.2%}")
+    for col in ["sharpe", "sortino", "calmar"]:
+        pretty[col] = pretty[col].map(lambda x: f"{x:6.2f}")
+    print(pretty.to_string())
+
+    config.ensure_dirs()
+    report.to_csv(config.REPORT_DIR / "dynamic_portfolio_performance.csv")
+    logger.info(
+        "Saved dynamic scorecard → %s",
+        config.REPORT_DIR / "dynamic_portfolio_performance.csv",
+    )
+    return report
+
+
+def plot_dynamic_equity_curves(
+    long: pd.DataFrame,
+    backtests: dict[str, "object"],
+    filename: str = "dynamic_equity_curve.png",
+) -> str:
+    """
+    Plot the net compounding equity curve of each strategy against a
+    buy-and-hold SPY curve over the matching window (base = 1.0).
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    config.ensure_dirs()
+    fig, ax = plt.subplots(figsize=(11, 6))
+
+    union_index = None
+    for label, bt in backtests.items():
+        curve = bt.equity_curve
+        ax.plot(curve.index, curve.values, linewidth=1.6, label=f"{label} (net)")
+        union_index = curve.index if union_index is None else union_index.union(curve.index)
+
+    spy_rets = _spy_returns_on(union_index, long)
+    spy_curve = equity_curve(spy_rets)
+    ax.plot(spy_curve.index, spy_curve.values, linewidth=1.6,
+            linestyle="--", color="black", label=f"{config.BENCHMARK} (buy & hold)")
+
+    ax.set_title("Dynamic Rebalanced Portfolio vs S&P 500 — Growth of $1 (net of costs)")
+    ax.set_ylabel("Equity (base = 1.0)")
+    ax.set_xlabel("Date")
+    ax.legend()
+    fig.tight_layout()
+    path = config.FIGURE_DIR / filename
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    logger.info("Saved dynamic equity curve → %s", path)
+    return str(path)

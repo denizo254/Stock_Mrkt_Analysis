@@ -25,6 +25,7 @@ Every stage logs to stdout and to outputs/reports/pipeline.log.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 
 import pandas as pd
@@ -37,13 +38,18 @@ from src.evaluation import (
     evaluate_classification,
     evaluate_regression,
     evaluation_summary,
+    explain_model,
     plot_confusion_matrix,
     plot_roc_curve,
 )
 from src.feature_engineering import build_features_for_ticker, feature_columns
 from src.modeling import predict_regression, train_classifier, train_regressor
-from src.performance import benchmark_report
-from src.portfolio_optimization import optimize_portfolio
+from src.performance import (
+    benchmark_report,
+    dynamic_benchmark_report,
+    plot_dynamic_equity_curves,
+)
+from src.portfolio_optimization import optimize_portfolio, rolling_rebalance_backtest
 from src.utils import banner, configure_logging, get_logger
 
 
@@ -62,6 +68,10 @@ def parse_args() -> argparse.Namespace:
                    help="Skip Phase 4 modeling + Phase 5 model evaluation.")
     p.add_argument("--model-implied-mu", action="store_true",
                    help="Use model-predicted mean returns as μ in the optimizer.")
+    p.add_argument("--rebalance-freq", choices=["M", "Q"], default=config.REBALANCE.frequency,
+                   help="Rolling rebalancing frequency: M=monthly, Q=quarterly.")
+    p.add_argument("--no-shap", action="store_true",
+                   help="Disable SHAP explainability (use native gain only).")
     p.add_argument("--verbose", action="store_true", help="DEBUG-level logging.")
     return p.parse_args()
 
@@ -107,6 +117,10 @@ def run_modeling_stage(
         plot_confusion_matrix(clf_rep)
         plot_roc_curve(clf_model, clf_split.X_test, clf_split.y_test)
 
+        # Step 3 — explainability: which indicators carry the signal?
+        explain_model(reg_model, reg_split.X_test)
+        explain_model(clf_model, clf_split.X_test)
+
     evaluation_summary(reg_reports, clf_reports)
     return model_implied_mu
 
@@ -119,6 +133,10 @@ def main() -> None:
         log_file=config.REPORT_DIR / "pipeline.log",
     )
     logger = get_logger("main")
+
+    # Honour --no-shap by swapping in a tweaked (still-frozen) EXPLAIN config.
+    if args.no_shap:
+        config.EXPLAIN = dataclasses.replace(config.EXPLAIN, enable_shap=False)
 
     logger.info(banner("STOCK MARKET ANALYSIS & INVESTMENT OPTIMIZATION", char="#"))
     logger.info("Universe: %s | Benchmark: %s", args.tickers, config.BENCHMARK)
@@ -145,11 +163,12 @@ def main() -> None:
         logger.info("Using model-implied expected returns for optimization:\n%s",
                     mu_override.round(4).to_string())
 
+    # Static (full-sample) snapshot — efficient frontier + reference weights.
     opt = optimize_portfolio(
         long, tickers=args.tickers, expected_returns_override=mu_override
     )
 
-    # ---- Phase 5(c): portfolio performance vs benchmark -------------------
+    # ---- Phase 5(c): STATIC portfolio performance vs benchmark ------------
     benchmark_report(
         long,
         {
@@ -157,6 +176,21 @@ def main() -> None:
             "Min Variance": opt.min_variance.weights,
         },
     )
+
+    # ---- Phase 5(d): DYNAMIC rolling rebalancing backtest (Step 2) --------
+    logger.info(banner("PHASE 5 — DYNAMIC ROLLING REBALANCING BACKTEST"))
+    backtests = {
+        "Max Sharpe": rolling_rebalance_backtest(
+            long, tickers=args.tickers, strategy="max_sharpe",
+            frequency=args.rebalance_freq, mu_override=mu_override,
+        ),
+        "Min Variance": rolling_rebalance_backtest(
+            long, tickers=args.tickers, strategy="min_variance",
+            frequency=args.rebalance_freq,
+        ),
+    }
+    dynamic_benchmark_report(long, backtests)
+    plot_dynamic_equity_curves(long, backtests)
 
     logger.info(banner("PIPELINE COMPLETE", char="#"))
     logger.info("Artifacts written under: %s", config.OUTPUT_DIR)

@@ -17,10 +17,19 @@ benchmarked end-to-end against the S&P 500.
 |----------------|-----------|--------|
 | **1. Business Understanding** | [`docs/phase1_business_understanding.md`](docs/phase1_business_understanding.md) | Objectives, success metrics, benchmarks |
 | **2. Data Understanding** | `src/data_ingestion.py`, `src/eda.py` | Cached OHLCV, missing-data audit, volume anomalies, correlation heatmap, **ADF stationarity tests** |
-| **3. Data Preparation** | `src/feature_engineering.py`, `src/data_splitting.py` | Leakage-free feature matrix (technical + statistical + lagged), chronological splits |
-| **4. Modeling** | `src/modeling.py` | Tuned **XGBoost/Ridge regressor** + **XGBoost/Logistic classifier** with `TimeSeriesSplit` CV |
-| **5. Evaluation** | `src/evaluation.py`, `src/portfolio_optimization.py`, `src/performance.py` | Confusion matrices, ROC-AUC, MAE/RMSE, **efficient frontier**, Max-Sharpe & Min-Variance weights, Sharpe/Sortino/Drawdown vs SPY |
-| **6. Deployment** | `main.py` | One-command end-to-end pipeline with logging |
+| **3. Data Preparation** | `src/feature_engineering.py`, `src/data_splitting.py` | Leakage-free feature matrix (technical + statistical + lagged), chronological splits, **Walk-Forward Validation** |
+| **4. Modeling** | `src/modeling.py` | Tuned **XGBoost/Ridge regressor** + **XGBoost/Logistic classifier**, **heavily regularised** (L1/L2/gamma + subsampling), **walk-forward CV** |
+| **5. Evaluation** | `src/evaluation.py`, `src/portfolio_optimization.py`, `src/performance.py` | Confusion matrices, ROC-AUC, MAE/RMSE, **SHAP explainability**, **efficient frontier**, Max-Sharpe & Min-Variance weights, **dynamic rolling rebalancing backtest** with transaction costs, Sharpe/Sortino/Drawdown vs SPY |
+| **6. Deployment** | `main.py`, **`app.py`** | One-command end-to-end pipeline + **interactive Streamlit dashboard** |
+
+### 🏛️ Institutional-grade enhancements
+
+| # | Enhancement | Where |
+|---|-------------|-------|
+| **1** | **Walk-Forward Validation** (rolling 12m-train / 1m-test) replaces static CV; **heavy XGBoost regularisation** (shallow `max_depth∈{1,2,3}`, L1 `reg_alpha`, L2 `reg_lambda`, split-penalty `gamma>0`, 0.7 row/column subsampling) | `data_splitting.py`, `modeling.py` |
+| **2** | **Dynamic rolling rebalancing engine** — monthly/quarterly re-optimisation on trailing windows, drifting weights, **transaction-cost drag (5–10 bps on turnover)**, compounding net equity curve | `portfolio_optimization.py`, `performance.py` |
+| **3** | **SHAP explainability** (TreeExplainer) + native gain/weight/cover — ranks which indicators carry signal vs noise; exports plots + CSVs | `evaluation.py` |
+| **4** | **Streamlit dashboard** — interactive Plotly equity curve vs SPY, rolling allocations, efficient frontier, live scorecards | `app.py` |
 
 ---
 
@@ -29,6 +38,7 @@ benchmarked end-to-end against the S&P 500.
 ```
 Stock Market Analysis/
 ├── main.py                       # Phase 6 — end-to-end orchestrator (CLI)
+├── app.py                        # Phase 6 — interactive Streamlit dashboard
 ├── config.py                     # Single source of truth: tickers, windows, params
 ├── requirements.txt
 ├── README.md
@@ -80,8 +90,21 @@ python main.py --tickers AAPL MSFT NVDA # custom universe (SPY added automatical
 python main.py --start 2019-01-01       # custom window
 python main.py --skip-models            # data + EDA + optimization only (fast)
 python main.py --model-implied-mu       # feed model-predicted returns into the optimizer
+python main.py --rebalance-freq Q       # quarterly (vs default monthly) rebalancing
+python main.py --no-shap                # native gain importances instead of SHAP
 python main.py --refresh --verbose      # re-download + DEBUG logging
 ```
+
+### Interactive dashboard
+
+```bash
+streamlit run app.py
+```
+
+Pick the universe, rebalancing frequency, estimation lookback, transaction
+cost, and strategy in the sidebar, then click **Run analysis** to render the
+dynamic equity curve vs SPY, rolling allocations, the efficient frontier, and
+the risk-adjusted scorecard — all interactive Plotly.
 
 ---
 
@@ -93,8 +116,13 @@ python main.py --refresh --verbose      # re-download + DEBUG logging
 - **Lagged features only** for past information; the prediction target is the
   *only* forward-looking column and is created with an explicit `shift(-1)`.
 - **Chronological splits** — the most recent 20% is an untouched hold-out test
-  set; hyper-parameters are tuned with expanding-window `TimeSeriesSplit`
-  (every validation fold lies strictly after its training fold).
+  set; hyper-parameters are tuned with a **rolling Walk-Forward Validator**
+  (fixed 12-month train / 1-month test window sliding forward one month at a
+  time — every validation fold lies strictly after its training fold, exactly
+  mirroring periodic production re-fits).
+- **Rolling portfolio backtest** — at each monthly/quarterly rebalance the
+  optimiser sees only the trailing estimation window (`.loc[:date]`), so the
+  out-of-sample equity curve never peeks at the future.
 
 ### Feature catalogue (Phase 3)
 - **Technical:** SMA/EMA (20/50/200, as price ratios), RSI(14, Wilder),

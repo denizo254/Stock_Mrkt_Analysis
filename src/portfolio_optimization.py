@@ -355,3 +355,193 @@ def optimize_portfolio(
         expected_returns=mu,
         cov_matrix=cov,
     )
+
+
+# ===========================================================================
+# STEP 2 — DYNAMIC ROLLING REBALANCING ENGINE
+# ===========================================================================
+# The static optimizer above produces a single snapshot allocation from the
+# full sample (which itself peeks at the whole history). A realistic process
+# re-optimises periodically using ONLY past data, holds the weights between
+# rebalances, and pays a transaction-cost drag on turnover. The engine below
+# simulates exactly that and produces a compounding, out-of-sample equity
+# curve. Every estimation window is sliced with ``.loc[:date]`` so look-ahead
+# bias is structurally impossible.
+
+
+@dataclass
+class RollingBacktestResult:
+    """Output of a walk-forward portfolio backtest."""
+
+    strategy: str
+    equity_curve: pd.Series          # net of costs, base = 1.0
+    gross_equity_curve: pd.Series    # before costs
+    daily_returns: pd.Series         # net daily simple returns
+    weights_history: pd.DataFrame    # index = rebalance date, columns = tickers
+    turnover: pd.Series              # one-way turnover per rebalance date
+    total_cost: float                # cumulative cost as a return-fraction sum
+    rebalance_dates: pd.DatetimeIndex
+    n_rebalances: int
+
+
+def _rebalance_dates(index: pd.DatetimeIndex, frequency: str) -> pd.DatetimeIndex:
+    """
+    Last available trading day of each calendar month ('M') or quarter ('Q').
+
+    Decisions are made at the close of these dates and take effect on the next
+    trading day, so no future information leaks into the chosen weights.
+    """
+    freq = frequency.upper()
+    if freq not in {"M", "Q"}:
+        raise ValueError("frequency must be 'M' (monthly) or 'Q' (quarterly).")
+    periods = index.to_period(freq)
+    df = pd.DataFrame({"date": index, "period": periods})
+    last_per_period = df.groupby("period", sort=True)["date"].max()
+    return pd.DatetimeIndex(last_per_period.values)
+
+
+def _optimise_weights(
+    strategy: str,
+    mu: pd.Series,
+    cov: pd.DataFrame,
+) -> pd.Series:
+    """Dispatch to the requested allocation rule and return a weight Series."""
+    if strategy == "max_sharpe":
+        return maximum_sharpe_portfolio(mu, cov).weights
+    if strategy == "min_variance":
+        return minimum_variance_portfolio(mu, cov).weights
+    if strategy == "equal_weight":
+        n = len(mu)
+        return pd.Series(np.repeat(1.0 / n, n), index=mu.index)
+    raise ValueError(f"Unknown strategy '{strategy}'.")
+
+
+def rolling_rebalance_backtest(
+    long: pd.DataFrame,
+    tickers: list[str] | None = None,
+    strategy: str = config.REBALANCE.strategy,
+    frequency: str = config.REBALANCE.frequency,
+    lookback_days: int = config.REBALANCE.lookback_days,
+    rolling_lookback: bool = config.REBALANCE.rolling_lookback,
+    cost_rate: float = config.REBALANCE.cost_rate,
+    mu_override: pd.Series | None = None,
+) -> RollingBacktestResult:
+    """
+    Walk-forward portfolio backtest with periodic rebalancing + trading costs.
+
+    Procedure
+    ---------
+    1. Build the daily SIMPLE-return panel (simple returns aggregate linearly
+       across assets and compound across time — the correct unit for an equity
+       curve).
+    2. Determine rebalance dates (month/quarter ends).
+    3. At each rebalance date ``d`` use only returns in ``(:d]`` (optionally the
+       trailing ``lookback_days``) to estimate μ (annualised mean of log
+       returns, or ``mu_override``) and Σ (annualised covariance), then solve
+       for the target weights under ``strategy``.
+    4. Weights take effect the NEXT trading day and then DRIFT with returns
+       until the following rebalance. At each rebalance we charge
+       ``turnover × cost_rate`` as a same-day return drag, where turnover is
+       ``Σ|w_target − w_drifted|`` (full traded volume, buys + sells).
+
+    Returns a :class:`RollingBacktestResult` with the net & gross equity
+    curves, the full weight history, and turnover/cost diagnostics.
+    """
+    tickers = tickers or config.TICKERS
+    panel = get_price_panel(long, "Adj Close")[tickers].dropna()
+    simple = panel.pct_change().dropna()
+    log_ret = np.log(panel / panel.shift(1)).dropna()
+    all_dates = simple.index
+
+    rebal_dates = _rebalance_dates(all_dates, frequency)
+    min_obs = lookback_days if rolling_lookback else max(len(tickers) + 2, 21)
+
+    # ---- 1. Pre-compute target weights at each valid rebalance date --------
+    targets: dict[pd.Timestamp, pd.Series] = {}
+    turnover_records: dict[pd.Timestamp, float] = {}
+    for d in rebal_dates:
+        window = log_ret.loc[:d]
+        if rolling_lookback:
+            window = window.tail(lookback_days)
+        if len(window) < min_obs:
+            continue
+        mu = mu_override.reindex(tickers) if mu_override is not None else annualised_mean(window)
+        cov = annualised_cov(window)
+        targets[d] = _optimise_weights(strategy, mu, cov).reindex(tickers).fillna(0.0)
+
+    if not targets:
+        raise RuntimeError(
+            "No rebalance date had enough history. Lower lookback_days or "
+            "widen the date range."
+        )
+
+    # Map each target to the first trading day it becomes active.
+    eff_target: dict[pd.Timestamp, pd.Series] = {}
+    pos_of = {dt: i for i, dt in enumerate(all_dates)}
+    for d, w in targets.items():
+        nxt = pos_of[d] + 1
+        if nxt < len(all_dates):
+            eff_target[all_dates[nxt]] = w
+
+    # ---- 2. Simulate forward day-by-day ------------------------------------
+    sim_dates = all_dates[all_dates >= min(eff_target)]
+    equity, gross_equity = 1.0, 1.0
+    drift_w: pd.Series | None = None
+    rows = []
+    total_cost = 0.0
+
+    for date in sim_dates:
+        cost = 0.0
+        if date in eff_target:
+            new_w = eff_target[date]
+            if drift_w is None:
+                turnover = float(new_w.abs().sum())            # initial buy from cash
+            else:
+                turnover = float((new_w - drift_w.reindex(new_w.index).fillna(0.0)).abs().sum())
+            cost = turnover * cost_rate
+            total_cost += cost
+            turnover_records[date] = turnover
+            drift_w = new_w.copy()
+
+        r = simple.loc[date, drift_w.index]
+        gross_ret = float((drift_w * r).sum())
+        net_ret = gross_ret - cost
+
+        gross_equity *= 1.0 + gross_ret
+        equity *= 1.0 + net_ret
+        rows.append(
+            {"date": date, "net_ret": net_ret, "gross_ret": gross_ret,
+             "equity": equity, "gross_equity": gross_equity}
+        )
+
+        # Drift the weights with the day's price moves for tomorrow.
+        drifted = drift_w * (1.0 + r)
+        drift_w = drifted / drifted.sum()
+
+    sim = pd.DataFrame(rows).set_index("date")
+    weights_history = pd.DataFrame(targets).T
+    weights_history.index.name = "rebalance_date"
+
+    result = RollingBacktestResult(
+        strategy=strategy,
+        equity_curve=sim["equity"],
+        gross_equity_curve=sim["gross_equity"],
+        daily_returns=sim["net_ret"],
+        weights_history=weights_history,
+        turnover=pd.Series(turnover_records).sort_index(),
+        total_cost=total_cost,
+        rebalance_dates=pd.DatetimeIndex(list(targets.keys())),
+        n_rebalances=len(targets),
+    )
+    logger.info(
+        "[%s] rolling backtest: %d rebalances, %s→%s, total cost drag=%.2f%%, "
+        "final equity=%.3fx (gross %.3fx)",
+        strategy,
+        result.n_rebalances,
+        sim.index.min().date(),
+        sim.index.max().date(),
+        total_cost * 100,
+        equity,
+        gross_equity,
+    )
+    return result
