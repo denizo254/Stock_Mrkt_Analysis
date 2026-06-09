@@ -1,5 +1,9 @@
 # 📈 Stock Market Analysis & Investment Optimization
 
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://denizo254-stock-mrkt-analysis-app-k7n9td.streamlit.app/)
+
+**🔴 Live demo:** **https://denizo254-stock-mrkt-analysis-app-k7n9td.streamlit.app/**
+
 A **production-grade, CRISP-DM structured** data-science pipeline that ingests
 historical equity data, engineers a rich technical/statistical feature set,
 trains next-day return & direction models, evaluates them rigorously, and
@@ -119,7 +123,9 @@ frontier, and the risk-adjusted scorecard — all interactive Plotly.
 
 ### Deploy to Streamlit Community Cloud (free)
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/deploy?repository=denizo254/Stock_Mrkt_Analysis&branch=main&mainModule=app.py)
+The app is **already deployed** at
+**https://denizo254-stock-mrkt-analysis-app-k7n9td.streamlit.app/**. To deploy
+your own fork:
 
 1. Push the repo to GitHub (already at `denizo254/Stock_Mrkt_Analysis`).
 2. Go to **https://share.streamlit.io** and sign in with GitHub.
